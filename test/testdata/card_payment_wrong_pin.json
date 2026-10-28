@@ -1,0 +1,38 @@
+{
+  "SaleId": 900001,
+  "TimeNow": "2026-10-26T12:00:00-03:00",
+  "Amount": "25.33",
+  "Status": "PENDING",
+  "PaymentType": "DEBIT",
+  "Emv": {
+    "PAN": {
+      "Tag": "Wg==",
+      "Length": 8,
+      "Value": "UgBQAAAAAAY="
+    },
+    "DateExpiry": {
+      "Tag": "XyQ=",
+      "Length": 3,
+      "Value": "MRIx"
+    },
+    "TransactionCountry": {
+      "Tag": "nxo=",
+      "Length": 2,
+      "Value": "AHY="
+    },
+    "Pin": {
+      "PIN": "fa45dfb58eb8e52dfa6888b859bf0dc0c9eacb779f62eac9010874791ea19b43",
+      "CVM": "ONLINE_PIN"
+    },
+    "NumberUnpredictable": {
+      "Tag": "nzc=",
+      "Length": 4,
+      "Value": "AHyA/w=="
+    },
+    "Cryptogram": {
+      "Tag": "nyY=",
+      "Length": 16,
+      "Value": "TBPpxnuG1a6jmwlXm5qPzQ=="
+    }
+  }
+}
