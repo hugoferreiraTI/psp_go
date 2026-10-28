@@ -1,14 +1,12 @@
 package model
 
-// AuthorizationResponse é a decisão devolvida ao request de autorização.
+// AuthorizationResponse é devolvida na própria requisição HTTP da Card Machine.
+// Amount usa decimal com duas casas, calculado a partir dos centavos, sem float.
+// Dados que não puderem ser determinados em uma reprovação ficam vazios.
 type AuthorizationResponse struct {
-	Status  SaleStatus `json:"status"`
-	Message string     `json:"message"`
-}
-
-// AuthorizationResult transporta somente o ID da venda e a decisão já tomada.
-// Mantém SaleId e Status com os nomes usados pelo protocolo da Card Machine.
-type AuthorizationResult struct {
-	SaleId int        `json:"SaleId"`
-	Status SaleStatus `json:"Status"`
+	Status      SaleStatus      `json:"status"`
+	PaymentType CardPaymentType `json:"payment_type"`
+	CardNetwork CardNetwork     `json:"card_network"`
+	IssuerBank  IssuerBank      `json:"issuer_bank"`
+	Amount      string          `json:"amount"`
 }

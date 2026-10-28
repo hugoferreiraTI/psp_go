@@ -247,6 +247,36 @@ func TestCreatCardUsecase(t *testing.T) {
 	}
 }
 
+// SaleCard retorna os dados que o handler serializa na resposta HTTP.
+// Crédito permanece reprovado; aqui também verificamos o valor sem float.
+func TestSaleCardResponse(t *testing.T) {
+	for _, tt := range []struct {
+		amount    string
+		cents     int64
+		formatted string
+	}{
+		{amount: "00025.33", cents: 2533, formatted: "25.33"},
+		{amount: "-0.01", cents: -1, formatted: "-0.01"},
+		{amount: "92233720368547758.07", cents: 9223372036854775807, formatted: "92233720368547758.07"},
+	} {
+		t.Run(tt.amount, func(t *testing.T) {
+			repo, mock := newRepositoryMock(t)
+			mock.ExpectQuery(createPendingSaleQuery).WithArgs(900001, "PENDING").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(99))
+			mock.ExpectExec(updateSaleDetailsQuery).WithArgs(manualCardPAN, tt.cents, "CREDIT", nil, 99, "PENDING").WillReturnResult(sqlmock.NewResult(0, 1))
+			mock.ExpectExec(updateSaleStatusQuery).WithArgs("REPROVED", 99, "PENDING").WillReturnResult(sqlmock.NewResult(0, 1))
+			keys := newPaymentTestKeys(t)
+			payment := newSecuredPaymentWithPIN(t, keys, manualCardPIN)
+			payment.PaymentType, payment.Amount = model.Credit, tt.amount
+			result := usecases.NewSaleCaseDependency(repo).SaleCard(payment, keys)
+			want := model.AuthorizationResponse{Status: model.StatusReproved, PaymentType: model.Credit, CardNetwork: model.NetworkMastercard, IssuerBank: model.IssuerNubank, Amount: tt.formatted}
+			if result != want {
+				t.Fatal("SaleCard deve retornar a decisão com o valor decimal exato")
+			}
+			t.Logf("Teste aprovado, valor: %+v", result)
+		})
+	}
+}
+
 // Restaura os JSONs e cadastra o cartão somente se ausente; não altera existentes.
 // PSP_PREPARE_PAYMENT=1 go test ./test -run '^TestPrepareManualCardPayment$' -v -count=1
 func TestPrepareManualCardPayment(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -13,7 +14,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/lib/pq"
 
-	"psp_go/internal/client"
 	"psp_go/internal/db"
 	"psp_go/internal/handler"
 	"psp_go/internal/model"
@@ -24,7 +24,7 @@ import (
 
 func TestAuthorizeCardInvalidJSON(t *testing.T) {
 	router := gin.New()
-	cardHandler := handler.NewCardHandler(nil, usecases.PaymentKeys{}, nil)
+	cardHandler := handler.NewCardHandler(nil, usecases.PaymentKeys{})
 	router.POST("/authorize/card", cardHandler.AuthorizeCard)
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/authorize/card", bytes.NewBufferString("{")))
@@ -65,7 +65,7 @@ func TestAddValueHTTP(t *testing.T) {
 				}
 			}
 			router := gin.New()
-			cardHandler := handler.NewCardHandler(usecases.NewSaleCaseDependency(repo), usecases.PaymentKeys{}, nil)
+			cardHandler := handler.NewCardHandler(usecases.NewSaleCaseDependency(repo), usecases.PaymentKeys{})
 			router.POST("/card/add-value", cardHandler.AddValueInCard)
 			recorder := httptest.NewRecorder()
 			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/card/add-value", bytes.NewBufferString(tt.payload)))
@@ -120,7 +120,7 @@ func TestCreatCardHTTP(t *testing.T) {
 				}
 			}
 			router := gin.New()
-			cardHandler := handler.NewCardHandler(usecases.NewSaleCaseDependency(repo), usecases.PaymentKeys{}, nil)
+			cardHandler := handler.NewCardHandler(usecases.NewSaleCaseDependency(repo), usecases.PaymentKeys{})
 			router.POST("/card/create", cardHandler.CreatCard)
 			recorder := httptest.NewRecorder()
 			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/card/create", bytes.NewBufferString(tt.payload)))
@@ -149,13 +149,12 @@ func TestCreatCardHTTP(t *testing.T) {
 	}
 }
 
-// Valida a resposta e o callback; falha no callback não muda a autorização.
+// A resposta da própria requisição contém a decisão e os dados da venda.
 func TestAuthorizeCard(t *testing.T) {
 	keys := newPaymentTestKeys(t)
 	for _, tt := range []struct {
 		name       string
 		pin        string
-		callback   int
 		want       model.SaleStatus
 		saveErr    error
 		balance    int64
@@ -164,17 +163,16 @@ func TestAuthorizeCard(t *testing.T) {
 		invalidMAC bool
 		missing    bool
 	}{
-		{name: "aprovado", pin: manualCardPIN, callback: http.StatusNoContent, want: model.StatusApproved, balance: 10000},
-		{name: "TLV inválido também tem histórico", pin: manualCardPIN, callback: http.StatusNoContent, want: model.StatusReproved, invalidTLV: true},
-		{name: "CMAC inválido também tem histórico", pin: manualCardPIN, callback: http.StatusNoContent, want: model.StatusReproved, invalidMAC: true},
-		{name: "cartão não encontrado também tem histórico", pin: manualCardPIN, callback: http.StatusNoContent, want: model.StatusReproved, missing: true},
-		{name: "PIN errado", pin: "9999", callback: http.StatusNoContent, want: model.StatusReproved, balance: 10000},
-		{name: "saldo zero", pin: manualCardPIN, callback: http.StatusNoContent, want: model.StatusReproved, balance: 0},
-		{name: "saldo insuficiente", pin: manualCardPIN, callback: http.StatusNoContent, want: model.StatusReproved, balance: 2532},
-		{name: "saldo exato", pin: manualCardPIN, callback: http.StatusNoContent, want: model.StatusApproved, balance: 2533},
-		{name: "saldo mudou após consulta", pin: manualCardPIN, callback: http.StatusNoContent, want: model.StatusReproved, balance: 10000, changed: true},
-		{name: "callback indisponível", pin: manualCardPIN, callback: http.StatusServiceUnavailable, want: model.StatusApproved, balance: 10000},
-		{name: "falha ao gravar", pin: manualCardPIN, callback: http.StatusNoContent, want: model.StatusReproved, saveErr: errors.New("falha ao atualizar aprovação"), balance: 10000},
+		{name: "aprovado", pin: manualCardPIN, want: model.StatusApproved, balance: 10000},
+		{name: "TLV inválido também tem histórico", pin: manualCardPIN, want: model.StatusReproved, invalidTLV: true},
+		{name: "CMAC inválido também tem histórico", pin: manualCardPIN, want: model.StatusReproved, invalidMAC: true},
+		{name: "cartão não encontrado também tem histórico", pin: manualCardPIN, want: model.StatusReproved, missing: true},
+		{name: "PIN errado", pin: "9999", want: model.StatusReproved, balance: 10000},
+		{name: "saldo zero", pin: manualCardPIN, want: model.StatusReproved, balance: 0},
+		{name: "saldo insuficiente", pin: manualCardPIN, want: model.StatusReproved, balance: 2532},
+		{name: "saldo exato", pin: manualCardPIN, want: model.StatusApproved, balance: 2533},
+		{name: "saldo mudou após consulta", pin: manualCardPIN, want: model.StatusReproved, balance: 10000, changed: true},
+		{name: "falha ao gravar", pin: manualCardPIN, want: model.StatusReproved, saveErr: errors.New("falha ao atualizar aprovação"), balance: 10000},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			repo, mock := newRepositoryMock(t)
@@ -217,19 +215,8 @@ func TestAuthorizeCard(t *testing.T) {
 			if tt.want == model.StatusReproved {
 				mock.ExpectExec(updateSaleStatusQuery).WithArgs("REPROVED", 99, "PENDING").WillReturnResult(sqlmock.NewResult(0, 1))
 			}
-			callbacks := make(chan model.AuthorizationResult, 2)
-			machine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				var result model.AuthorizationResult
-				if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" || json.NewDecoder(r.Body).Decode(&result) != nil {
-					w.WriteHeader(http.StatusBadRequest)
-					return
-				}
-				callbacks <- result
-				w.WriteHeader(tt.callback)
-			}))
-			defer machine.Close()
 			router := gin.New()
-			cardHandler := handler.NewCardHandler(usecases.NewSaleCaseDependency(repo), keys, client.NewCardMachineClient(machine.URL, nil))
+			cardHandler := handler.NewCardHandler(usecases.NewSaleCaseDependency(repo), keys)
 			router.POST("/authorize/card", cardHandler.AuthorizeCard)
 			payment := newSecuredPaymentWithPIN(t, keys, tt.pin)
 			if tt.invalidTLV {
@@ -242,23 +229,31 @@ func TestAuthorizeCard(t *testing.T) {
 			if err != nil {
 				t.Fatal("falha ao preparar JSON de teste")
 			}
-			recorder := httptest.NewRecorder()
-			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/authorize/card", bytes.NewReader(payload)))
+			// Simula a Card Machine lendo resp.Body do POST original à PSP.
+			server := httptest.NewServer(router)
+			defer server.Close()
+			httpResponse, err := http.Post(server.URL+"/authorize/card", "application/json", bytes.NewReader(payload))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer httpResponse.Body.Close()
+			body, err := io.ReadAll(httpResponse.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
 			var response model.AuthorizationResponse
-			message := "payment reproved"
-			if tt.want == model.StatusApproved {
-				message = "payment approved"
+			want := model.AuthorizationResponse{Status: tt.want, PaymentType: model.Debit}
+			if !tt.invalidTLV {
+				want.CardNetwork, want.IssuerBank, want.Amount = model.NetworkMastercard, model.IssuerNubank, "25.33"
 			}
-			if json.Unmarshal(recorder.Body.Bytes(), &response) != nil || recorder.Code != http.StatusOK || response.Status != tt.want || response.Message != message {
-				t.Fatal("resposta HTTP diferente da decisão esperada")
+			var fields map[string]json.RawMessage
+			if json.Unmarshal(body, &response) != nil || json.Unmarshal(body, &fields) != nil || len(fields) != 5 || httpResponse.StatusCode != http.StatusOK || response != want {
+				t.Fatal("resposta HTTP deve conter somente os cinco campos esperados")
 			}
-			if len(callbacks) != 1 {
-				t.Fatal("esperado um único callback")
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal("o histórico e o débito devem estar finalizados antes da resposta HTTP")
 			}
-			if result := <-callbacks; result.SaleId != 900001 || result.Status != tt.want {
-				t.Fatal("callback não corresponde à venda e ao status retornados")
-			}
-			t.Logf("Teste aprovado, valor: HTTP %d, %+v", recorder.Code, response)
+			t.Logf("Teste aprovado, valor: HTTP %d, %+v", httpResponse.StatusCode, response)
 		})
 	}
 }
@@ -309,19 +304,8 @@ func TestSaleCard(t *testing.T) {
 	if err := connection.QueryRow("SELECT COALESCE(MAX(id), 0) FROM card_transactions").Scan(&lastID); err != nil {
 		t.Fatal("falha ao consultar transações antes da autorização")
 	}
-	callbacks := make(chan model.AuthorizationResult, 2)
-	machine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var result model.AuthorizationResult
-		if json.NewDecoder(r.Body).Decode(&result) != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		callbacks <- result
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer machine.Close()
 	router := gin.New()
-	cardHandler := handler.NewCardHandler(usecases.NewSaleCaseDependency(repo), keys, client.NewCardMachineClient(machine.URL, nil))
+	cardHandler := handler.NewCardHandler(usecases.NewSaleCaseDependency(repo), keys)
 	router.POST("/authorize/card", cardHandler.AuthorizeCard)
 	recorder := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/authorize/card", bytes.NewBufferString(payload))
@@ -330,12 +314,6 @@ func TestSaleCard(t *testing.T) {
 	var response model.AuthorizationResponse
 	if json.Unmarshal(recorder.Body.Bytes(), &response) != nil || recorder.Code != http.StatusOK || response.Status != wantStatus {
 		t.Fatalf("HTTP %d, status=%s; esperado=%s", recorder.Code, response.Status, wantStatus)
-	}
-	if len(callbacks) != 1 {
-		t.Fatal("esperado um callback para a Card Machine simulada")
-	}
-	if result := <-callbacks; result.SaleId != payment.SaleId || result.Status != response.Status {
-		t.Fatal("callback diferente da decisão retornada")
 	}
 	var count int
 	if err := connection.QueryRow("SELECT count(*) FROM card_transactions WHERE sale_id = $1 AND id > $2", payment.SaleId, lastID).Scan(&count); err != nil || count != 1 {

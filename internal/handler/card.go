@@ -2,27 +2,25 @@ package handler
 
 import (
 	"errors"
-	"log"
+	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 
-	"psp_go/internal/client"
 	"psp_go/internal/model"
 	"psp_go/internal/repository"
 	"psp_go/internal/usecases"
 )
 
 type CardHandler struct {
-	saleCase    *usecases.SaleCase
-	keys        usecases.PaymentKeys
-	cardMachine *client.CardMachineClient
+	saleCase *usecases.SaleCase
+	keys     usecases.PaymentKeys
 }
 
 // NewCardHandler injeta as chaves do usuário atendido por esta instância do
 // MVP. Elas vêm da configuração confiável, nunca do JSON recebido.
-func NewCardHandler(saleCase *usecases.SaleCase, keys usecases.PaymentKeys, cardMachine *client.CardMachineClient) *CardHandler {
-	return &CardHandler{saleCase: saleCase, keys: keys, cardMachine: cardMachine}
+func NewCardHandler(saleCase *usecases.SaleCase, keys usecases.PaymentKeys) *CardHandler {
+	return &CardHandler{saleCase: saleCase, keys: keys}
 }
 
 func (h *CardHandler) CreatCard(c *gin.Context) {
@@ -58,22 +56,16 @@ func (h *CardHandler) AddValueInCard(c *gin.Context) {
 }
 
 func (h *CardHandler) AuthorizeCard(c *gin.Context) {
+	fmt.Println("[AuthorizeCard] POST /authorize/card recebido")
 	var payment model.CardPayment
 	if err := c.ShouldBindJSON(&payment); err != nil {
+		fmt.Println("[AuthorizeCard] bind do JSON falhou; resposta HTTP 400")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload", "message": err.Error()})
 		return
 	}
 
-	status := h.saleCase.SaleCard(payment, h.keys)
-	message := "payment reproved"
-	if status == model.StatusApproved {
-		message = "payment approved"
-	}
-	c.JSON(http.StatusOK, model.AuthorizationResponse{Status: status, Message: message})
-	// Envia a resposta antes de iniciar o POST de retorno, sem goroutine, fila
-	// ou retry. O timeout do client limita a duração da chamada de saída.
-	c.Writer.Flush()
-	if err := h.cardMachine.SendAuthorizationResult(c.Request.Context(), payment.SaleId, status); err != nil {
-		log.Printf("falha no retorno da autorização sale_id=%d: %v", payment.SaleId, err)
-	}
+	fmt.Printf("[AuthorizeCard] sale_id=%d JSON decodificado; chamando SaleCard\n", payment.SaleId)
+	result := h.saleCase.SaleCard(payment, h.keys)
+	c.JSON(http.StatusOK, result)
+	fmt.Printf("[AuthorizeCard] sale_id=%d resposta HTTP 200 status=%s\n", payment.SaleId, result.Status)
 }

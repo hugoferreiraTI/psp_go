@@ -8,7 +8,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 
-	"psp_go/internal/client"
 	"psp_go/internal/db"
 	"psp_go/internal/handler"
 	"psp_go/internal/repository"
@@ -29,13 +28,10 @@ func main() {
 		log.Fatal("não foi possível conectar ao banco de dados")
 	}
 	defer connection.Close()
-
 	saleCase := usecases.NewSaleCaseDependency(repository.NewUserRepository(connection))
-	cardMachine := client.NewCardMachineClient(os.Getenv("CARD_MACHINE_CALLBACK_URL"), nil)
-	cardHandler := handler.NewCardHandler(saleCase, keys, cardMachine)
+	cardHandler := handler.NewCardHandler(saleCase, keys)
 
 	router := gin.New()
-
 	router.Use(gin.Recovery())
 
 	router.POST("/authorize/card", cardHandler.AuthorizeCard)
