@@ -8,11 +8,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
-	"github.com/lib/pq"
 
 	"psp_go/internal/db"
 	"psp_go/internal/handler"
@@ -112,12 +112,11 @@ func TestCreatCardHTTP(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			repo, mock := newRepositoryMock(t)
 			if tt.insert {
+				mock.ExpectQuery(existsPANQuery).WithArgs(manualCardPAN).WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(tt.duplicate))
+			}
+			if tt.insert && !tt.duplicate {
 				query := mock.ExpectQuery(insertCardQuery).WithArgs(manualCardPAN, "MASTERCARD", "NUBANK", "DEBIT", bcryptHashArgument{}, manualCardExpiry, int64(0), "ACTIVE")
-				if tt.duplicate {
-					query.WillReturnError(&pq.Error{Code: "23505"})
-				} else {
-					query.WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(2))
-				}
+				query.WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(2))
 			}
 			router := gin.New()
 			cardHandler := handler.NewCardHandler(usecases.NewSaleCaseDependency(repo), usecases.PaymentKeys{})
@@ -151,109 +150,162 @@ func TestCreatCardHTTP(t *testing.T) {
 
 // A resposta da própria requisição contém a decisão e os dados da venda.
 func TestAuthorizeCard(t *testing.T) {
+	rowsForType := func(card *model.Card, paymentType model.CardPaymentType) *sqlmock.Rows {
+		if paymentType == model.Credit {
+			return creditCardRows(card)
+		}
+		return cardRows(card)
+	}
 	keys := newPaymentTestKeys(t)
-	for _, tt := range []struct {
-		name       string
-		pin        string
-		want       model.SaleStatus
-		saveErr    error
-		balance    int64
-		changed    bool
-		invalidTLV bool
-		invalidMAC bool
-		missing    bool
-	}{
-		{name: "aprovado", pin: manualCardPIN, want: model.StatusApproved, balance: 10000},
-		{name: "TLV inválido também tem histórico", pin: manualCardPIN, want: model.StatusReproved, invalidTLV: true},
-		{name: "CMAC inválido também tem histórico", pin: manualCardPIN, want: model.StatusReproved, invalidMAC: true},
-		{name: "cartão não encontrado também tem histórico", pin: manualCardPIN, want: model.StatusReproved, missing: true},
-		{name: "PIN errado", pin: "9999", want: model.StatusReproved, balance: 10000},
-		{name: "saldo zero", pin: manualCardPIN, want: model.StatusReproved, balance: 0},
-		{name: "saldo insuficiente", pin: manualCardPIN, want: model.StatusReproved, balance: 2532},
-		{name: "saldo exato", pin: manualCardPIN, want: model.StatusApproved, balance: 2533},
-		{name: "saldo mudou após consulta", pin: manualCardPIN, want: model.StatusReproved, balance: 10000, changed: true},
-		{name: "falha ao gravar", pin: manualCardPIN, want: model.StatusReproved, saveErr: errors.New("falha ao atualizar aprovação"), balance: 10000},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			repo, mock := newRepositoryMock(t)
-			mock.ExpectQuery(createPendingSaleQuery).WithArgs(900001, "PENDING").
-				WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(99))
-			if !tt.invalidTLV {
-				mock.ExpectExec(updateSaleDetailsQuery).WithArgs(manualCardPAN, int64(2533), "DEBIT", nil, 99, "PENDING").WillReturnResult(sqlmock.NewResult(0, 1))
-				if !tt.invalidMAC {
-					card := testCard(t)
-					card.Balance = tt.balance
-					if tt.missing {
-						mock.ExpectQuery(selectCardQuery).WithArgs(manualCardPAN).WillReturnRows(cardRows(nil))
+	for _, paymentType := range []model.CardPaymentType{model.Debit, model.Credit} {
+		t.Run(string(paymentType), func(t *testing.T) {
+			selectQuery, detailsQuery, movementQuery, approveQuery := selectCardQuery, updateSaleDetailsQuery, debitCardQuery, approveSaleQuery
+			if paymentType == model.Credit {
+				selectQuery, detailsQuery, movementQuery, approveQuery = selectCreditCardQuery, updateCreditSaleDetailsQuery, chargeCreditCardQuery, approveCreditSaleQuery
+			}
+
+			for _, tt := range []struct {
+				name       string
+				pin        string
+				want       model.SaleStatus
+				saveErr    error
+				balance    int64
+				changed    bool
+				invalidTLV bool
+				invalidMAC bool
+				missing    bool
+				invalidGCM bool
+				expired    bool
+				cardChange func(*model.Card)
+				wantLog    string
+			}{
+				{name: "aprovado", pin: manualCardPIN, want: model.StatusApproved, balance: 10000},
+				{name: "TLV inválido também tem histórico", wantLog: "Dados EMV inválidos.", pin: manualCardPIN, want: model.StatusReproved, invalidTLV: true},
+				{name: "CMAC inválido também tem histórico", wantLog: "Criptograma inválido.", pin: manualCardPIN, want: model.StatusReproved, invalidMAC: true},
+				{name: "cartão não encontrado também tem histórico", wantLog: "Cartão inexistente para este tipo de pagamento.", pin: manualCardPIN, want: model.StatusReproved, missing: true},
+				{name: "PIN errado", wantLog: "PIN incorreto.", pin: "9999", want: model.StatusReproved, balance: 10000},
+				{name: "hash ausente", wantLog: "Cadastro de autenticação do cartão inválido.", pin: manualCardPIN, want: model.StatusReproved, balance: 10000, cardChange: func(c *model.Card) { c.PINHash = "" }},
+				{name: "PAN divergente", wantLog: "Dados do cartão divergentes do cadastro.", pin: manualCardPIN, want: model.StatusReproved, balance: 10000, cardChange: func(c *model.Card) { c.PAN = "4000000000000002" }},
+				{name: "bandeira divergente", wantLog: "Dados do cartão divergentes do cadastro.", pin: manualCardPIN, want: model.StatusReproved, balance: 10000, cardChange: func(c *model.Card) { c.CardNetwork = model.NetworkVisa }},
+				{name: "emissor divergente", wantLog: "Dados do cartão divergentes do cadastro.", pin: manualCardPIN, want: model.StatusReproved, balance: 10000, cardChange: func(c *model.Card) { c.IssuerBank = model.IssuerItau }},
+				{name: "validade divergente", wantLog: "Validade divergente do cadastro.", pin: manualCardPIN, want: model.StatusReproved, balance: 10000, cardChange: func(c *model.Card) { c.DateExpiry = "321231" }},
+				{name: "cartão expirado", wantLog: "Cartão expirado.", pin: manualCardPIN, want: model.StatusReproved, balance: 10000, expired: true, cardChange: func(c *model.Card) { c.DateExpiry = "010101" }},
+				{name: "tipo cadastrado divergente", wantLog: "Tipo de cartão divergente do pagamento.", pin: manualCardPIN, want: model.StatusReproved, balance: 10000, cardChange: func(c *model.Card) {
+					if c.CardType == model.Debit {
+						c.CardType = model.Credit
 					} else {
-						mock.ExpectQuery(selectCardQuery).WithArgs(manualCardPAN).WillReturnRows(cardRows(card))
-						mock.ExpectExec(updateSaleDetailsQuery).WithArgs(manualCardPAN, int64(2533), "DEBIT", 1, 99, "PENDING").WillReturnResult(sqlmock.NewResult(0, 1))
-						if tt.pin == manualCardPIN && tt.balance >= 2533 {
-							mock.ExpectBegin()
-							rows := int64(1)
-							if tt.changed {
-								rows = 0
+						c.CardType = model.Debit
+					}
+				}},
+				{name: "AES-GCM inválido", wantLog: "Não foi possível autenticar o PIN recebido.", pin: manualCardPIN, want: model.StatusReproved, balance: 10000, invalidGCM: true},
+				{name: "saldo zero", wantLog: "Saldo insuficiente.", pin: manualCardPIN, want: model.StatusReproved, balance: 0},
+				{name: "saldo insuficiente", wantLog: "Saldo insuficiente.", pin: manualCardPIN, want: model.StatusReproved, balance: 2532},
+				{name: "saldo exato", pin: manualCardPIN, want: model.StatusApproved, balance: 2533},
+				{name: "saldo mudou após consulta", wantLog: "Saldo insuficiente.", pin: manualCardPIN, want: model.StatusReproved, balance: 10000, changed: true},
+				{name: "falha ao gravar", wantLog: "Não foi possível processar o pagamento.", pin: manualCardPIN, want: model.StatusReproved, saveErr: errors.New("erro privado PAN=5200500000000006 PIN=2468 chave=segredo"), balance: 10000},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					repo, mock := newRepositoryMock(t)
+					mock.ExpectQuery(createPendingSaleQuery).WithArgs(900001, "PENDING").
+						WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(99))
+					if !tt.invalidTLV {
+						mock.ExpectExec(detailsQuery).WithArgs(manualCardPAN, int64(2533), string(paymentType), nil, 99, "PENDING").WillReturnResult(sqlmock.NewResult(0, 1))
+						if !tt.invalidMAC {
+							card := testCard(t)
+							card.Balance = tt.balance
+							card.CardType = paymentType
+							card.Limit, card.Amount = 36800+tt.balance, 36800
+							if tt.cardChange != nil {
+								tt.cardChange(card)
 							}
-							mock.ExpectExec(debitCardQuery).WithArgs(int64(2533), 1).WillReturnResult(sqlmock.NewResult(0, rows))
-							if rows > 0 {
-								update := mock.ExpectExec(approveSaleQuery).WithArgs("APPROVED", 99, "PENDING", 1, int64(2533), "DEBIT")
-								if tt.saveErr != nil {
-									update.WillReturnError(tt.saveErr)
-								} else {
-									update.WillReturnResult(sqlmock.NewResult(0, 1))
-								}
-							}
-							if rows == 0 || tt.saveErr != nil {
-								mock.ExpectRollback()
+							if tt.missing {
+								mock.ExpectQuery(selectQuery).WithArgs(manualCardPAN).WillReturnRows(rowsForType(nil, paymentType))
 							} else {
-								mock.ExpectCommit()
+								mock.ExpectQuery(selectQuery).WithArgs(manualCardPAN).WillReturnRows(rowsForType(card, paymentType))
+								mock.ExpectExec(detailsQuery).WithArgs(manualCardPAN, int64(2533), string(paymentType), 1, 99, "PENDING").WillReturnResult(sqlmock.NewResult(0, 1))
+								if tt.want == model.StatusApproved || tt.changed || tt.saveErr != nil {
+									mock.ExpectBegin()
+									rows := int64(1)
+									if tt.changed {
+										rows = 0
+									}
+									mock.ExpectExec(movementQuery).WithArgs(int64(2533), 1).WillReturnResult(sqlmock.NewResult(0, rows))
+									if rows > 0 {
+										update := mock.ExpectExec(approveQuery).WithArgs("APPROVED", 99, "PENDING", 1, int64(2533), string(paymentType))
+										if tt.saveErr != nil {
+											update.WillReturnError(tt.saveErr)
+										} else {
+											update.WillReturnResult(sqlmock.NewResult(0, 1))
+										}
+									}
+									if rows == 0 || tt.saveErr != nil {
+										mock.ExpectRollback()
+									} else {
+										mock.ExpectCommit()
+									}
+								}
 							}
 						}
 					}
-				}
+					if tt.want == model.StatusReproved {
+						mock.ExpectExec(updateSaleStatusQuery).WithArgs("REPROVED", 99, "PENDING").WillReturnResult(sqlmock.NewResult(0, 1))
+					}
+					router := gin.New()
+					cardHandler := handler.NewCardHandler(usecases.NewSaleCaseDependency(repo), keys)
+					router.POST("/authorize/card", cardHandler.AuthorizeCard)
+					payment := newSecuredPaymentWithPIN(t, keys, tt.pin)
+					payment.PaymentType = paymentType
+					if tt.invalidGCM {
+						payment.Emv.Pin.PIN = "00"
+					}
+					if tt.expired {
+						payment.Emv.DateExpiry.Value = []byte{0x01, 0x01, 0x01}
+					}
+					if tt.invalidTLV {
+						payment.Emv.PAN.Length--
+					}
+					if tt.invalidMAC {
+						payment.Emv.Cryptogram.Value[0] ^= 1
+					}
+					payload, err := json.Marshal(payment)
+					if err != nil {
+						t.Fatal("falha ao preparar JSON de teste")
+					}
+					// Simula a Card Machine lendo resp.Body do POST original à PSP.
+					server := httptest.NewServer(router)
+					defer server.Close()
+					httpResponse, err := http.Post(server.URL+"/authorize/card", "application/json", bytes.NewReader(payload))
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer httpResponse.Body.Close()
+					body, err := io.ReadAll(httpResponse.Body)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var response model.AuthorizationResponse
+					want := model.AuthorizationResponse{Status: tt.want, PaymentType: paymentType, TimeNow: payment.TimeNow, Log: tt.wantLog}
+					if paymentType == model.Credit && want.Log == "Saldo insuficiente." {
+						want.Log = "Limite de crédito insuficiente."
+					}
+					if !tt.invalidTLV {
+						want.CardNetwork, want.IssuerBank, want.Amount = model.NetworkMastercard, model.IssuerNubank, "25.33"
+					}
+					var fields map[string]json.RawMessage
+					if json.Unmarshal(body, &response) != nil || json.Unmarshal(body, &fields) != nil || len(fields) != 7 || httpResponse.StatusCode != http.StatusOK || response != want {
+						t.Fatal("resposta HTTP deve conter os sete campos esperados, incluindo log com motivo seguro")
+					}
+					for _, secret := range []string{manualCardPAN, tt.pin, keys.CMACKeyHex, keys.GCMKeyHex, "segredo"} {
+						if secret != "" && strings.Contains(string(body), secret) {
+							t.Fatal("resposta expôs dados sensíveis")
+						}
+					}
+					if err := mock.ExpectationsWereMet(); err != nil {
+						t.Fatal("o histórico e o débito devem estar finalizados antes da resposta HTTP")
+					}
+					t.Logf("Teste aprovado, valor: HTTP %d, %+v", httpResponse.StatusCode, response)
+				})
 			}
-			if tt.want == model.StatusReproved {
-				mock.ExpectExec(updateSaleStatusQuery).WithArgs("REPROVED", 99, "PENDING").WillReturnResult(sqlmock.NewResult(0, 1))
-			}
-			router := gin.New()
-			cardHandler := handler.NewCardHandler(usecases.NewSaleCaseDependency(repo), keys)
-			router.POST("/authorize/card", cardHandler.AuthorizeCard)
-			payment := newSecuredPaymentWithPIN(t, keys, tt.pin)
-			if tt.invalidTLV {
-				payment.Emv.PAN.Length--
-			}
-			if tt.invalidMAC {
-				payment.Emv.Cryptogram.Value[0] ^= 1
-			}
-			payload, err := json.Marshal(payment)
-			if err != nil {
-				t.Fatal("falha ao preparar JSON de teste")
-			}
-			// Simula a Card Machine lendo resp.Body do POST original à PSP.
-			server := httptest.NewServer(router)
-			defer server.Close()
-			httpResponse, err := http.Post(server.URL+"/authorize/card", "application/json", bytes.NewReader(payload))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer httpResponse.Body.Close()
-			body, err := io.ReadAll(httpResponse.Body)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var response model.AuthorizationResponse
-			want := model.AuthorizationResponse{Status: tt.want, PaymentType: model.Debit}
-			if !tt.invalidTLV {
-				want.CardNetwork, want.IssuerBank, want.Amount = model.NetworkMastercard, model.IssuerNubank, "25.33"
-			}
-			var fields map[string]json.RawMessage
-			if json.Unmarshal(body, &response) != nil || json.Unmarshal(body, &fields) != nil || len(fields) != 5 || httpResponse.StatusCode != http.StatusOK || response != want {
-				t.Fatal("resposta HTTP deve conter somente os cinco campos esperados")
-			}
-			if err := mock.ExpectationsWereMet(); err != nil {
-				t.Fatal("o histórico e o débito devem estar finalizados antes da resposta HTTP")
-			}
-			t.Logf("Teste aprovado, valor: HTTP %d, %+v", httpResponse.StatusCode, response)
 		})
 	}
 }

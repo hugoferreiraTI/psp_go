@@ -9,4 +9,6 @@ type AuthorizationResponse struct {
 	CardNetwork CardNetwork     `json:"card_network"`
 	IssuerBank  IssuerBank      `json:"issuer_bank"`
 	Amount      string          `json:"amount"`
+	TimeNow     string          `json:"time_now"` // Data e hora recebidas da Card Machine.
+	Log         string          `json:"log"`      // Motivo seguro da reprovação; vazio quando aprovado.
 }

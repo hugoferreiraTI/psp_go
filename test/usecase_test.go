@@ -8,9 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	confluent "github.com/confluentinc/confluent-kafka-go/kafka"
+	"math"
 	"os"
 	"path/filepath"
+	kafkaconfig "psp_go/internal/kafka"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/hugoferreiraTI/AES_CMAC_Go/cmac"
@@ -57,7 +62,8 @@ func TestVerifyTransaction(t *testing.T) {
 		{"válida", func(p *model.DecodedCardPayment) {}, nil},
 		{"país incorreto", func(p *model.DecodedCardPayment) { p.TransactionCountry = "0840" }, securitysale.ErrInvalidTransactionCountry},
 		{"status recebido aprovado", func(p *model.DecodedCardPayment) { p.Status = model.StatusApproved }, securitysale.ErrInvalidStatus},
-		{"crédito", func(p *model.DecodedCardPayment) { p.PaymentType = model.Credit }, securitysale.ErrUnsupportedPaymentType},
+		{"crédito", func(p *model.DecodedCardPayment) { p.PaymentType = model.Credit }, nil},
+		{"tipo inválido", func(p *model.DecodedCardPayment) { p.PaymentType = "PIX" }, securitysale.ErrUnsupportedPaymentType},
 		{"data inexistente", func(p *model.DecodedCardPayment) { p.DateExpiry = "310230" }, securitysale.ErrInvalidDateExpiryFormat},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -116,6 +122,32 @@ func TestVerifyDebitBalance(t *testing.T) {
 			err := usecases.VerifyDebitBalance(tt.balance, tt.amount, tt.kind)
 			if !errors.Is(err, tt.err) {
 				t.Fatalf("erro=%v; esperado=%v", err, tt.err)
+			}
+			t.Logf("Teste aprovado, valor: %v", err)
+		})
+	}
+}
+
+func TestVerifyCreditLimit(t *testing.T) {
+	for _, tt := range []struct {
+		name                string
+		limit, used, amount int64
+		paymentType         model.CardPaymentType
+		wantErr             error
+	}{
+		{name: "368 mais 100 cabe em 1000", limit: 100000, used: 36800, amount: 10000, paymentType: model.Credit},
+		{name: "total igual ao limite", limit: 46800, used: 36800, amount: 10000, paymentType: model.Credit},
+		{name: "total acima do limite", limit: 46799, used: 36800, amount: 10000, paymentType: model.Credit, wantErr: repository.ErrInsufficientCreditLimit},
+		{name: "limite esgotado", limit: 36800, used: 36800, amount: 1, paymentType: model.Credit, wantErr: repository.ErrInsufficientCreditLimit},
+		{name: "valor zero", limit: 100000, amount: 0, paymentType: model.Credit, wantErr: repository.ErrInvalidAmount},
+		{name: "valor negativo", limit: 100000, amount: -1, paymentType: model.Credit, wantErr: repository.ErrInvalidAmount},
+		{name: "overflow bloqueado", limit: math.MaxInt64, used: math.MaxInt64 - 1, amount: 2, paymentType: model.Credit, wantErr: repository.ErrInsufficientCreditLimit},
+		{name: "tipo incorreto", limit: 100000, amount: 1, paymentType: model.Debit, wantErr: repository.ErrUnsupportedPaymentType},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := usecases.VerifyCreditLimit(tt.limit, tt.used, tt.amount, tt.paymentType)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("erro=%v; esperado=%v", err, tt.wantErr)
 			}
 			t.Logf("Teste aprovado, valor: %v", err)
 		})
@@ -229,6 +261,7 @@ func TestCreatCardUsecase(t *testing.T) {
 			repo, mock := newRepositoryMock(t)
 			if tt.wantErr == nil {
 				// O matcher comprova bcrypt com o PIN original e custo padrão.
+				mock.ExpectQuery(existsPANQuery).WithArgs(card.PAN).WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 				mock.ExpectQuery(insertCardQuery).WithArgs(card.PAN, "MASTERCARD", "NUBANK", "DEBIT", bcryptHashArgument{pin: card.PIN}, card.DateExpiry, int64(0), "ACTIVE").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(2))
 			}
 			id, err := usecases.NewSaleCaseDependency(repo).CreatCard(card)
@@ -248,7 +281,7 @@ func TestCreatCardUsecase(t *testing.T) {
 }
 
 // SaleCard retorna os dados que o handler serializa na resposta HTTP.
-// Crédito permanece reprovado; aqui também verificamos o valor sem float.
+// O CMAC deixa de corresponder ao alterar Amount; o retorno mantém o valor sem float.
 func TestSaleCardResponse(t *testing.T) {
 	for _, tt := range []struct {
 		amount    string
@@ -262,19 +295,51 @@ func TestSaleCardResponse(t *testing.T) {
 		t.Run(tt.amount, func(t *testing.T) {
 			repo, mock := newRepositoryMock(t)
 			mock.ExpectQuery(createPendingSaleQuery).WithArgs(900001, "PENDING").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(99))
-			mock.ExpectExec(updateSaleDetailsQuery).WithArgs(manualCardPAN, tt.cents, "CREDIT", nil, 99, "PENDING").WillReturnResult(sqlmock.NewResult(0, 1))
+			mock.ExpectExec(updateSaleDetailsQuery).WithArgs(manualCardPAN, tt.cents, "DEBIT", nil, 99, "PENDING").WillReturnResult(sqlmock.NewResult(0, 1))
 			mock.ExpectExec(updateSaleStatusQuery).WithArgs("REPROVED", 99, "PENDING").WillReturnResult(sqlmock.NewResult(0, 1))
 			keys := newPaymentTestKeys(t)
 			payment := newSecuredPaymentWithPIN(t, keys, manualCardPIN)
-			payment.PaymentType, payment.Amount = model.Credit, tt.amount
+			payment.Amount = tt.amount
 			result := usecases.NewSaleCaseDependency(repo).SaleCard(payment, keys)
-			want := model.AuthorizationResponse{Status: model.StatusReproved, PaymentType: model.Credit, CardNetwork: model.NetworkMastercard, IssuerBank: model.IssuerNubank, Amount: tt.formatted}
+			want := model.AuthorizationResponse{Status: model.StatusReproved, PaymentType: model.Debit, CardNetwork: model.NetworkMastercard, IssuerBank: model.IssuerNubank, Amount: tt.formatted, TimeNow: payment.TimeNow, Log: "Criptograma inválido."}
 			if result != want {
 				t.Fatal("SaleCard deve retornar a decisão com o valor decimal exato")
 			}
 			t.Logf("Teste aprovado, valor: %+v", result)
 		})
 	}
+}
+
+// Tipos desconhecidos não acessam cartões nem movimentam valores, mas têm histórico.
+func TestSaleCardPaymentType(t *testing.T) {
+	for _, paymentType := range []model.CardPaymentType{"PIX", ""} {
+		t.Run(string(paymentType), func(t *testing.T) {
+			repo, mock := newRepositoryMock(t)
+			mock.ExpectQuery(createPendingSaleQuery).WithArgs(900001, "PENDING").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(99))
+			mock.ExpectExec(updateSaleStatusQuery).WithArgs("REPROVED", 99, "PENDING").WillReturnResult(sqlmock.NewResult(0, 1))
+			payment := model.CardPayment{SaleId: 900001, PaymentType: paymentType, TimeNow: "2026-10-29T12:00:00-03:00"}
+			result := usecases.NewSaleCaseDependency(repo).SaleCard(payment, usecases.PaymentKeys{})
+			want := model.AuthorizationResponse{Status: model.StatusReproved, PaymentType: paymentType, TimeNow: payment.TimeNow, Log: "Tipo de pagamento não suportado."}
+			if result != want {
+				t.Fatal("tipo inválido deve ser reprovado antes de validar o cartão")
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("Teste aprovado, valor: %+v", result)
+		})
+	}
+}
+
+func TestSaleCardInternalErrorLog(t *testing.T) {
+	repo, mock := newRepositoryMock(t)
+	// Erros externos podem conter dados privados; o retorno deve usar texto fixo.
+	mock.ExpectQuery(createPendingSaleQuery).WithArgs(900001, "PENDING").WillReturnError(errors.New("PAN=5201000000000006 PIN=2468 chave=segredo"))
+	result := usecases.NewSaleCaseDependency(repo).SaleCard(model.CardPayment{SaleId: 900001, PaymentType: model.Debit}, usecases.PaymentKeys{})
+	if result.Status != model.StatusReproved || result.Log != "Não foi possível processar o pagamento." {
+		t.Fatal("erro interno deve retornar motivo genérico sem dados privados")
+	}
+	t.Logf("Teste aprovado, valor: %s", result.Log)
 }
 
 // Restaura os JSONs e cadastra o cartão somente se ausente; não altera existentes.
@@ -399,4 +464,140 @@ func newSecuredPaymentWithPIN(t *testing.T, keys usecases.PaymentKeys, pin strin
 	}
 	payment.Emv.Pin = model.PIN{PIN: hex.EncodeToString(gcm.Seal(nonce, nonce, []byte(pin), nil)), CVM: model.CVMOnlinePIN}
 	return payment
+}
+
+// Broker Kafka em memória: verifica eventos reais sem acessar Kafka/PostgreSQL locais.
+func TestKafkaAuthorizationEvents(t *testing.T) {
+	cluster, err := confluent.NewMockCluster(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cluster.Close()
+	t.Setenv("KAFKA_BOOTSTRAP_SERVERS", cluster.BootstrapServers())
+	producer, err := kafkaconfig.NewKafkaProducer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer producer.Close()
+	publisher := kafkaconfig.NewProducerCaseDependency(producer)
+	keys := newPaymentTestKeys(t)
+	expected := map[int][]model.PaymentKafka{}
+	cases := []struct {
+		kind                             model.CardPaymentType
+		approved, invalidTLV, createFail bool
+	}{
+		{kind: model.Debit, approved: true}, {kind: model.Debit}, {kind: model.Credit, approved: true}, {kind: model.Credit},
+		{kind: model.Debit, invalidTLV: true}, {kind: model.Credit, createFail: true},
+	}
+	for index, tt := range cases {
+		repo, mock := newRepositoryMock(t)
+		payment := newSecuredPaymentWithPIN(t, keys, manualCardPIN)
+		payment.SaleId = 900100 + index
+		payment.PaymentType = tt.kind
+		if !tt.approved && !tt.invalidTLV && !tt.createFail {
+			payment = newSecuredPaymentWithPIN(t, keys, "9999")
+			payment.SaleId = 900100 + index
+			payment.PaymentType = tt.kind
+		}
+		pending := mock.ExpectQuery(createPendingSaleQuery).WithArgs(payment.SaleId, "PENDING")
+		if tt.createFail {
+			pending.WillReturnError(errors.New("banco indisponível"))
+		} else {
+			pending.WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(99))
+		}
+		if tt.invalidTLV {
+			payment.Emv.PAN.Length--
+		}
+		if !tt.invalidTLV && !tt.createFail {
+			mock.ExpectExec(updateSaleDetailsQuery).WithArgs(manualCardPAN, int64(2533), string(tt.kind), nil, 99, "PENDING").WillReturnResult(sqlmock.NewResult(0, 1))
+			card := testCard(t)
+			card.CardType = tt.kind
+			card.Balance = 10000
+			card.Limit = 10000
+			selectQuery, rows := selectCardQuery, cardRows(card)
+			if tt.kind == model.Credit {
+				selectQuery, rows = selectCreditCardQuery, creditCardRows(card)
+			}
+			mock.ExpectQuery(selectQuery).WithArgs(manualCardPAN).WillReturnRows(rows)
+			mock.ExpectExec(updateSaleDetailsQuery).WithArgs(manualCardPAN, int64(2533), string(tt.kind), 1, 99, "PENDING").WillReturnResult(sqlmock.NewResult(0, 1))
+			if tt.approved {
+				movement := debitCardQuery
+				if tt.kind == model.Credit {
+					movement = chargeCreditCardQuery
+				}
+				mock.ExpectBegin()
+				mock.ExpectExec(movement).WithArgs(int64(2533), 1).WillReturnResult(sqlmock.NewResult(0, 1))
+				mock.ExpectExec(approveSaleQuery).WithArgs("APPROVED", 99, "PENDING", 1, int64(2533), string(tt.kind)).WillReturnResult(sqlmock.NewResult(0, 1))
+				mock.ExpectCommit()
+			}
+		}
+		if !tt.approved && !tt.createFail {
+			mock.ExpectExec(updateSaleStatusQuery).WithArgs("REPROVED", 99, "PENDING").WillReturnResult(sqlmock.NewResult(0, 1))
+		}
+		result := usecases.NewSaleCaseDependency(repo, publisher).SaleCard(payment, keys)
+		wantStatus := model.StatusReproved
+		if tt.approved {
+			wantStatus = model.StatusApproved
+		}
+		if result.Status != wantStatus {
+			t.Fatalf("decisão inesperada: %s, %s", result.Status, result.Log)
+		}
+		expected[payment.SaleId] = []model.PaymentKafka{
+			{SaleId: payment.SaleId, Value: "25.33", PaymentType: tt.kind, Status: model.StatusPending},
+			{SaleId: payment.SaleId, Value: "25.33", PaymentType: tt.kind, Status: wantStatus},
+		}
+	}
+	if remaining := producer.Flush(5000); remaining != 0 {
+		t.Fatalf("eventos sem entrega: %d", remaining)
+	}
+	consumer, err := confluent.NewConsumer(&confluent.ConfigMap{"bootstrap.servers": cluster.BootstrapServers(), "group.id": "psp-event-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer consumer.Close()
+	topic := kafkaconfig.Topic
+	metadata, err := consumer.GetMetadata(&topic, false, 5000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var partitions []confluent.TopicPartition
+	for _, part := range metadata.Topics[topic].Partitions {
+		partitions = append(partitions, confluent.TopicPartition{Topic: &topic, Partition: part.ID, Offset: confluent.OffsetBeginning})
+	}
+	if err := consumer.Assign(partitions); err != nil {
+		t.Fatal(err)
+	}
+	received := map[int]int{}
+	for total, deadline := 0, time.Now().Add(10*time.Second); total < len(cases)*2 && time.Now().Before(deadline); {
+		message, err := consumer.ReadMessage(100 * time.Millisecond)
+		if err != nil {
+			continue
+		}
+		var event model.PaymentKafka
+		if err := json.Unmarshal(message.Value, &event); err != nil {
+			t.Fatal(err)
+		}
+		sequence := received[event.SaleId]
+		pair, ok := expected[event.SaleId]
+		if !ok || sequence >= len(pair) || event != pair[sequence] || string(message.Key) != fmt.Sprint(event.SaleId) {
+			t.Fatalf("evento fora de ordem ou divergente: %+v", event)
+		}
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(message.Value, &fields) != nil || len(fields) != 4 {
+			t.Fatal("evento deve conter apenas os quatro metadados")
+		}
+		for _, secret := range []string{manualCardPAN, manualCardPIN, keys.CMACKeyHex, keys.GCMKeyHex} {
+			if strings.Contains(string(message.Value), secret) {
+				t.Fatal("evento contém informação sensível")
+			}
+		}
+		received[event.SaleId]++
+		total++
+	}
+	for id := range expected {
+		if received[id] != 2 {
+			t.Fatalf("sale_id=%d recebeu %d eventos; esperado 2", id, received[id])
+		}
+	}
+	t.Log("Teste aprovado, valor: PENDING seguido de APPROVED/REPROVED, débito e crédito, inclusive saídas antecipadas")
 }

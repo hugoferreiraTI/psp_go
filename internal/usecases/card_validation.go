@@ -2,6 +2,7 @@ package usecases
 
 import (
 	"errors"
+	"math"
 	"time"
 
 	"psp_go/internal/model"
@@ -49,6 +50,21 @@ func VerifyDebitBalance(balance, amount int64, paymentType model.CardPaymentType
 	}
 	if balance < amount {
 		return repository.ErrInsufficientBalance
+	}
+	return nil
+}
+
+// VerifyCreditLimit confere o valor utilizado mais a venda, sem overflow.
+// O UPDATE do repository repete a condição para pagamentos concorrentes.
+func VerifyCreditLimit(limit, used, amount int64, paymentType model.CardPaymentType) error {
+	if paymentType != model.Credit {
+		return repository.ErrUnsupportedPaymentType
+	}
+	if amount <= 0 {
+		return repository.ErrInvalidAmount
+	}
+	if used > math.MaxInt64-amount || used+amount > limit {
+		return repository.ErrInsufficientCreditLimit
 	}
 	return nil
 }

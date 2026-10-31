@@ -2,7 +2,6 @@ package handler
 
 import (
 	"errors"
-	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -56,16 +55,12 @@ func (h *CardHandler) AddValueInCard(c *gin.Context) {
 }
 
 func (h *CardHandler) AuthorizeCard(c *gin.Context) {
-	fmt.Println("[AuthorizeCard] POST /authorize/card recebido")
 	var payment model.CardPayment
 	if err := c.ShouldBindJSON(&payment); err != nil {
-		fmt.Println("[AuthorizeCard] bind do JSON falhou; resposta HTTP 400")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload", "message": err.Error()})
 		return
 	}
 
-	fmt.Printf("[AuthorizeCard] sale_id=%d JSON decodificado; chamando SaleCard\n", payment.SaleId)
 	result := h.saleCase.SaleCard(payment, h.keys)
 	c.JSON(http.StatusOK, result)
-	fmt.Printf("[AuthorizeCard] sale_id=%d resposta HTTP 200 status=%s\n", payment.SaleId, result.Status)
 }

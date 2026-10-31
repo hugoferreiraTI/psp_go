@@ -88,6 +88,8 @@ type Card struct {
 	PINHash     string `json:"-"`             // Somente hash bcrypt; nunca o PIN em texto.
 	DateExpiry  string // YYMMDD, mesmo formato da tag EMV 5F24.
 	Balance     int64
+	Limit       int64 // Crédito: limite total em centavos.
+	Amount      int64 // Crédito: valor já utilizado em centavos.
 	CardType    CardPaymentType
 	Status      string
 }

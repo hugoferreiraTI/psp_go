@@ -3,8 +3,10 @@ package usecases
 import (
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
+	kafkaconfig "psp_go/internal/kafka"
 	"psp_go/internal/model"
 	"psp_go/internal/parser"
 	"psp_go/internal/repository"
@@ -35,50 +37,76 @@ var binRanges = []binRange{
 }
 
 type SaleCase struct {
-	repo *repository.UserRepository
+	repo   *repository.UserRepository
+	events *kafkaconfig.NewProducerCase
 }
 
-func NewSaleCaseDependency(repo *repository.UserRepository) *SaleCase {
-	return &SaleCase{
-		repo: repo,
+func NewSaleCaseDependency(repo *repository.UserRepository, producer ...*kafkaconfig.NewProducerCase) *SaleCase {
+	s := &SaleCase{repo: repo}
+	if len(producer) > 0 {
+		s.events = producer[0]
 	}
+	return s
 }
 
 // SaleCard retorna a decisão da PSP após validar a transação e autenticar o PIN.
 // keys deve conter as chaves compartilhadas com a máquina daquele usuário.
-// Cada tentativa tem seu histórico. A aprovação e o débito são atômicos;
+// Cada tentativa tem seu histórico. A aprovação e a movimentação de saldo/limite são atômicas;
 // qualquer saída reprovada finaliza o mesmo registro sem movimentar saldo.
 func (s *SaleCase) SaleCard(saleCard model.CardPayment, keys PaymentKeys) (result model.AuthorizationResponse) {
 	result.Status = model.StatusReproved
+	result.Log = "Pagamento reprovado."
 	result.PaymentType = saleCard.PaymentType
-	fmt.Printf("[SaleCard] sale_id=%d início\n", saleCard.SaleId)
-	defer func() {
-		fmt.Printf("[SaleCard] sale_id=%d fim status=%s\n", saleCard.SaleId, result.Status)
-	}()
-	fmt.Printf("[SaleCard] sale_id=%d etapa=CreatePendingSale\n", saleCard.SaleId)
+	result.TimeNow = saleCard.TimeNow
+	if s.events != nil {
+		event := model.PaymentKafka{SaleId: saleCard.SaleId, Value: saleCard.Amount, PaymentType: saleCard.PaymentType, Status: model.StatusPending}
+		if err := s.events.ProducerGo(event); err != nil {
+			log.Printf("falha ao enfileirar evento PENDING sale_id=%d", saleCard.SaleId)
+		}
+		// Registrado antes do defer do histórico, para publicar a decisão após finalizá-lo.
+		defer func() {
+			event.Status = result.Status
+			if result.Amount != "" {
+				event.Value = result.Amount
+			}
+			if err := s.events.ProducerGo(event); err != nil {
+				log.Printf("falha ao enfileirar evento final sale_id=%d", saleCard.SaleId)
+			}
+		}()
+	}
 	transactionID, err := s.repo.CreatePendingSale(saleCard.SaleId)
 	if err != nil {
-		fmt.Printf("[SaleCard] sale_id=%d CreatePendingSale falhou: %v\n", saleCard.SaleId, err)
+		result.Log = authorizationLog(err)
 		return result
 	}
 	defer func() {
 		if result.Status == model.StatusReproved {
-			fmt.Printf("[SaleCard] sale_id=%d etapa=UpdateSaleStatus status=REPROVED\n", saleCard.SaleId)
 			if err := s.repo.UpdateSaleStatus(transactionID, result.Status); err != nil {
-				fmt.Printf("[SaleCard] sale_id=%d UpdateSaleStatus falhou: %v\n", saleCard.SaleId, err)
-			} else {
-				fmt.Printf("[SaleCard] sale_id=%d histórico REPROVED salvo\n", saleCard.SaleId)
+				log.Printf("falha ao registrar reprovação transaction_id=%d", transactionID)
+				result.Log += " Não foi possível salvar o histórico."
 			}
 		}
 	}()
 
-	fmt.Printf("[SaleCard] sale_id=%d etapa=DecodeTLV\n", saleCard.SaleId)
-	decoded, err := parser.DecodeTLV(saleCard)
-	if err != nil {
-		fmt.Printf("[SaleCard] sale_id=%d DecodeTLV falhou: %v\n", saleCard.SaleId, err)
+	// O histórico é comum; cada tipo segue sua própria função de autorização.
+	switch saleCard.PaymentType {
+	case model.Debit:
+		return s.debit(saleCard, keys, transactionID, result)
+	case model.Credit:
+		return s.credit(saleCard, keys, transactionID, result)
+	default:
+		result.Log = authorizationLog(repository.ErrUnsupportedPaymentType)
 		return result
 	}
-	fmt.Printf("[SaleCard] sale_id=%d etapa=formatar valor decimal\n", saleCard.SaleId)
+}
+
+// debit concentra as validações do cartão e a aprovação com débito atômico.
+func (s *SaleCase) debit(saleCard model.CardPayment, keys PaymentKeys, transactionID int, result model.AuthorizationResponse) model.AuthorizationResponse {
+	decoded, err := parser.DecodeTLV(saleCard)
+	if err != nil {
+		result.Log = authorizationLog(err)
+		return result
+	}
 	whole, fraction := decoded.AmountCents/100, decoded.AmountCents%100
 	sign := ""
 	if decoded.AmountCents < 0 {
@@ -88,74 +116,139 @@ func (s *SaleCase) SaleCard(saleCard model.CardPayment, keys PaymentKeys) (resul
 	// Preenche os metadados disponíveis também para vendas reprovadas.
 	// A decisão sobre routing permanece após as validações estruturais e CMAC.
 	var routingErr error
-	fmt.Printf("[SaleCard] sale_id=%d etapa=VerifyPANRouting\n", saleCard.SaleId)
 	result.CardNetwork, result.IssuerBank, routingErr = VerifyPANRouting(decoded.PAN)
-	if routingErr != nil {
-		fmt.Printf("[SaleCard] sale_id=%d VerifyPANRouting falhou: %v\n", saleCard.SaleId, routingErr)
-	} else {
-		fmt.Printf("[SaleCard] sale_id=%d VerifyPANRouting OK bandeira=%s emissor=%s\n", saleCard.SaleId, result.CardNetwork, result.IssuerBank)
-	}
-	fmt.Printf("[SaleCard] sale_id=%d etapa=UpdateSaleDetails\n", saleCard.SaleId)
 	if err := s.repo.UpdateSaleDetails(transactionID, decoded.PAN, decoded.AmountCents, decoded.PaymentType, nil); err != nil {
-		fmt.Printf("[SaleCard] sale_id=%d UpdateSaleDetails falhou: %v\n", saleCard.SaleId, err)
+		result.Log = authorizationLog(err)
 		return result
 	}
-	fmt.Printf("[SaleCard] sale_id=%d etapa=VerifyTransaction\n", saleCard.SaleId)
 	if err := securitysale.VerifyTransaction(decoded); err != nil {
-		fmt.Printf("[SaleCard] sale_id=%d VerifyTransaction falhou: %v\n", saleCard.SaleId, err)
+		result.Log = authorizationLog(err)
 		return result
 	}
-	fmt.Printf("[SaleCard] sale_id=%d etapa=VerifyCryptogram\n", saleCard.SaleId)
 	if err := VerifyCryptogram(saleCard, keys.CMACKeyHex); err != nil {
-		fmt.Printf("[SaleCard] sale_id=%d VerifyCryptogram falhou: %v\n", saleCard.SaleId, err)
+		result.Log = authorizationLog(err)
 		return result
 	}
 	if routingErr != nil {
+		result.Log = authorizationLog(routingErr)
 		return result
 	}
-	fmt.Printf("[SaleCard] sale_id=%d etapa=GetCardByPAN\n", saleCard.SaleId)
 	card, err := s.repo.GetCardByPAN(decoded.PAN)
 	if err != nil {
-		fmt.Printf("[SaleCard] sale_id=%d GetCardByPAN falhou: %v\n", saleCard.SaleId, err)
+		result.Log = authorizationLog(err)
 		return result
 	}
-	fmt.Printf("[SaleCard] sale_id=%d etapa=vincular cartão ao histórico\n", saleCard.SaleId)
 	if err := s.repo.UpdateSaleDetails(transactionID, decoded.PAN, decoded.AmountCents, decoded.PaymentType, &card.ID); err != nil {
-		fmt.Printf("[SaleCard] sale_id=%d vínculo do cartão falhou: %v\n", saleCard.SaleId, err)
+		result.Log = authorizationLog(err)
 		return result
 	}
-	fmt.Printf("[SaleCard] sale_id=%d etapa=VerifyCardIdentity\n", saleCard.SaleId)
+	if card.CardType != decoded.PaymentType {
+		result.Log = "Tipo de cartão divergente do pagamento."
+		return result
+	}
 	if err := VerifyCardIdentity(decoded, card, result.CardNetwork, result.IssuerBank); err != nil {
-		fmt.Printf("[SaleCard] sale_id=%d VerifyCardIdentity falhou: %v\n", saleCard.SaleId, err)
+		result.Log = authorizationLog(err)
 		return result
 	}
-	fmt.Printf("[SaleCard] sale_id=%d etapa=VerifyDateExpiry\n", saleCard.SaleId)
 	if err := VerifyDateExpiry(decoded.DateExpiry, card.DateExpiry, time.Now()); err != nil {
-		fmt.Printf("[SaleCard] sale_id=%d VerifyDateExpiry falhou: %v\n", saleCard.SaleId, err)
+		result.Log = authorizationLog(err)
 		return result
 	}
-	fmt.Printf("[SaleCard] sale_id=%d etapa=VerifyAESGCM\n", saleCard.SaleId)
 	pin, err := VerifyAESGCM(saleCard.Emv.Pin.PIN, keys.GCMKeyHex)
 	if err != nil {
-		fmt.Printf("[SaleCard] sale_id=%d VerifyAESGCM falhou: %v\n", saleCard.SaleId, err)
+		result.Log = authorizationLog(err)
 		return result
 	}
-	fmt.Printf("[SaleCard] sale_id=%d etapa=VerifyPIN\n", saleCard.SaleId)
 	if err := VerifyPIN(pin, card.PINHash); err != nil {
-		fmt.Printf("[SaleCard] sale_id=%d VerifyPIN falhou: %v\n", saleCard.SaleId, err)
+		result.Log = authorizationLog(err)
 		return result
 	}
-	fmt.Printf("[SaleCard] sale_id=%d etapa=VerifyDebitBalance\n", saleCard.SaleId)
 	if err := VerifyDebitBalance(card.Balance, decoded.AmountCents, decoded.PaymentType); err != nil {
-		fmt.Printf("[SaleCard] sale_id=%d VerifyDebitBalance falhou: %v\n", saleCard.SaleId, err)
+		result.Log = authorizationLog(err)
 		return result
 	}
-	fmt.Printf("[SaleCard] sale_id=%d etapa=ApproveSale\n", saleCard.SaleId)
 	if err := s.repo.ApproveSale(transactionID, card.ID, decoded.AmountCents); err != nil {
-		fmt.Printf("[SaleCard] sale_id=%d ApproveSale falhou: %v\n", saleCard.SaleId, err)
+		result.Log = authorizationLog(err)
 		return result
 	}
 	result.Status = model.StatusApproved
+	result.Log = ""
+	return result
+}
+
+// credit autentica como débito e soma a venda ao valor utilizado do limite.
+func (s *SaleCase) credit(saleCard model.CardPayment, keys PaymentKeys, transactionID int, result model.AuthorizationResponse) model.AuthorizationResponse {
+	decoded, err := parser.DecodeTLV(saleCard)
+	if err != nil {
+		result.Log = authorizationLog(err)
+		return result
+	}
+	whole, fraction := decoded.AmountCents/100, decoded.AmountCents%100
+	sign := ""
+	if decoded.AmountCents < 0 {
+		sign, whole, fraction = "-", -whole, -fraction
+	}
+	result.Amount = fmt.Sprintf("%s%d.%02d", sign, whole, fraction)
+	// Preenche os metadados disponíveis também para vendas reprovadas.
+	// A decisão sobre routing permanece após as validações estruturais e CMAC.
+	var routingErr error
+	result.CardNetwork, result.IssuerBank, routingErr = VerifyPANRouting(decoded.PAN)
+	if err := s.repo.UpdateSaleDetails(transactionID, decoded.PAN, decoded.AmountCents, decoded.PaymentType, nil); err != nil {
+		result.Log = authorizationLog(err)
+		return result
+	}
+	if err := securitysale.VerifyTransaction(decoded); err != nil {
+		result.Log = authorizationLog(err)
+		return result
+	}
+	if err := VerifyCryptogram(saleCard, keys.CMACKeyHex); err != nil {
+		result.Log = authorizationLog(err)
+		return result
+	}
+	if routingErr != nil {
+		result.Log = authorizationLog(routingErr)
+		return result
+	}
+	card, err := s.repo.GetCreditCardByPAN(decoded.PAN)
+	if err != nil {
+		result.Log = authorizationLog(err)
+		return result
+	}
+	if err := s.repo.UpdateSaleDetails(transactionID, decoded.PAN, decoded.AmountCents, decoded.PaymentType, &card.ID); err != nil {
+		result.Log = authorizationLog(err)
+		return result
+	}
+	if card.CardType != decoded.PaymentType {
+		result.Log = "Tipo de cartão divergente do pagamento."
+		return result
+	}
+	if err := VerifyCardIdentity(decoded, card, result.CardNetwork, result.IssuerBank); err != nil {
+		result.Log = authorizationLog(err)
+		return result
+	}
+	if err := VerifyDateExpiry(decoded.DateExpiry, card.DateExpiry, time.Now()); err != nil {
+		result.Log = authorizationLog(err)
+		return result
+	}
+	pin, err := VerifyAESGCM(saleCard.Emv.Pin.PIN, keys.GCMKeyHex)
+	if err != nil {
+		result.Log = authorizationLog(err)
+		return result
+	}
+	if err := VerifyPIN(pin, card.PINHash); err != nil {
+		result.Log = authorizationLog(err)
+		return result
+	}
+	if err := VerifyCreditLimit(card.Limit, card.Amount, decoded.AmountCents, decoded.PaymentType); err != nil {
+		result.Log = authorizationLog(err)
+		return result
+	}
+	if err := s.repo.ApproveCreditSale(transactionID, card.ID, decoded.AmountCents); err != nil {
+		result.Log = authorizationLog(err)
+		return result
+	}
+	result.Status = model.StatusApproved
+	result.Log = ""
 	return result
 }
 
@@ -213,4 +306,55 @@ func VerifyPANRouting(pan string) (model.CardNetwork, model.IssuerBank, error) {
 		}
 	}
 	return network, "", ErrUnknownIssuerBank
+}
+
+// authorizationLog usa somente mensagens fixas, nunca o conteúdo de erros externos.
+// Erros de SQL, payload ou configuração podem carregar dados que não devem sair na resposta.
+func authorizationLog(err error) string {
+	switch {
+	case errors.Is(err, repository.ErrCardNotFound):
+		return "Cartão inexistente para este tipo de pagamento."
+	case errors.Is(err, repository.ErrInsufficientBalance):
+		return "Saldo insuficiente."
+	case errors.Is(err, repository.ErrInsufficientCreditLimit):
+		return "Limite de crédito insuficiente."
+	case errors.Is(err, repository.ErrInvalidAmount), errors.Is(err, parser.ErrInvalidAmount):
+		return "Valor do pagamento inválido; informe um valor maior que zero."
+	case errors.Is(err, repository.ErrUnsupportedPaymentType), errors.Is(err, securitysale.ErrUnsupportedPaymentType):
+		return "Tipo de pagamento não suportado."
+	case errors.Is(err, repository.ErrSaleNotPending):
+		return "Transação já finalizada ou com dados divergentes."
+	case errors.Is(err, parser.ErrInvalidTLV):
+		return "Dados EMV inválidos."
+	case errors.Is(err, ErrInvalidPAN), errors.Is(err, securitysale.ErrInvalidPANFormat):
+		return "Número do cartão inválido."
+	case errors.Is(err, ErrUnsupportedCardNetwork):
+		return "Bandeira do cartão não suportada."
+	case errors.Is(err, ErrUnknownIssuerBank):
+		return "Emissor do cartão não identificado."
+	case errors.Is(err, ErrCardDataMismatch):
+		return "Dados do cartão divergentes do cadastro."
+	case errors.Is(err, securitysale.ErrInvalidDateExpiryFormat):
+		return "Formato ou data de validade inválidos."
+	case errors.Is(err, ErrDateExpiryMismatch):
+		return "Validade divergente do cadastro."
+	case errors.Is(err, ErrCardExpired):
+		return "Cartão expirado."
+	case errors.Is(err, securitysale.ErrInvalidTransactionCountry):
+		return "País da transação não suportado."
+	case errors.Is(err, securitysale.ErrInvalidStatus):
+		return "Status inicial do pagamento inválido; esperado PENDING."
+	case errors.Is(err, ErrInvalidCryptogram):
+		return "Criptograma inválido."
+	case errors.Is(err, ErrInvalidAESGCM):
+		return "Não foi possível autenticar o PIN recebido."
+	case errors.Is(err, ErrInvalidPIN):
+		return "PIN incorreto."
+	case errors.Is(err, ErrInvalidPINHash):
+		return "Cadastro de autenticação do cartão inválido."
+	case errors.Is(err, ErrInvalidPaymentKey):
+		return "Falha na configuração de segurança do pagamento."
+	default:
+		return "Não foi possível processar o pagamento."
+	}
 }

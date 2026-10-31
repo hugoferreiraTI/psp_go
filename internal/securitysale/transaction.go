@@ -12,7 +12,7 @@ var (
 	ErrInvalidDateExpiryFormat   = errors.New("validade deve ser uma data existente em YYMMDD")
 	ErrInvalidTransactionCountry = errors.New("país da transação deve ser Brasil (0076)")
 	ErrInvalidStatus             = errors.New("nova autorização deve receber status PENDING")
-	ErrUnsupportedPaymentType    = errors.New("tipo de pagamento deve ser DEBIT")
+	ErrUnsupportedPaymentType    = errors.New("tipo de pagamento deve ser DEBIT ou CREDIT")
 )
 
 // VerifyTransaction orquestra validações estruturais dos dados decodificados.
@@ -69,7 +69,7 @@ func verifyStatus(status model.SaleStatus) error {
 }
 
 func verifyPaymentType(paymentType model.CardPaymentType) error {
-	if paymentType != model.Debit {
+	if paymentType != model.Debit && paymentType != model.Credit {
 		return ErrUnsupportedPaymentType
 	}
 	return nil
